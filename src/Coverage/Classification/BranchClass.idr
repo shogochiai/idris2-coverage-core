@@ -16,7 +16,8 @@ module Coverage.Classification.BranchClass
 
 import Data.String
 
-import Coverage.Core.Types
+-- Re-export Core.Types for BranchId
+import public Coverage.Core.Types
 import Coverage.Classification.CrashReason
 
 %default total
