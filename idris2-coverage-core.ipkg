@@ -1,0 +1,14 @@
+package idris2-coverage-core
+version = 0.1.0
+authors = "lazy-idris team"
+brief = "Shared types for Idris2 coverage analysis tools"
+
+sourcedir = "src"
+
+depends = base, contrib
+
+modules = Coverage.Core.Types
+        , Coverage.Core.Exclusions
+        , Coverage.Core.Stats
+        , Coverage.Classification.CrashReason
+        , Coverage.Classification.BranchClass
