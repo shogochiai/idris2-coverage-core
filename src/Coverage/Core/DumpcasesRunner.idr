@@ -10,6 +10,7 @@
 module Coverage.Core.DumpcasesRunner
 
 import Data.List
+import Data.Maybe
 import Data.String
 import System
 import System.File
@@ -133,10 +134,56 @@ runDumpcasesEvm = runDumpcasesDefault EvmBackend
 -- Pack Build Support
 -- =============================================================================
 
-||| Run dumpcases using pack build (for better package resolution)
+||| Parse modules from ipkg file content
+parseModules : String -> List String
+parseModules content =
+  let ls = lines content
+      -- Find lines that contain module names (after "modules = " or continuation lines)
+      modulesSection = findModulesSection ls
+  in mapMaybe extractModuleName modulesSection
+  where
+    isModulesStart : String -> Bool
+    isModulesStart l = isPrefixOf "modules" (trim l)
+
+    isContinuation : String -> Bool
+    isContinuation l =
+      let t = trim l
+      in not (null t) && not (isPrefixOf "[" t) && not (elem '=' (unpack t))
+
+    extractModuleName : String -> Maybe String
+    extractModuleName l =
+      let t = trim l
+          -- Remove "modules = " prefix if present
+          afterEq = case break (== '=') (unpack t) of
+                      (_, []) => t
+                      (_, '=' :: rest) => trim (pack rest)
+                      _ => t
+          -- Remove commas
+          noComma = pack $ filter (/= ',') (unpack afterEq)
+          cleaned = trim noComma
+      in if null cleaned || isPrefixOf "--" cleaned || isPrefixOf "[" cleaned
+           then Nothing
+           else Just cleaned
+
+    collectModules : List String -> List String
+    collectModules [] = []
+    collectModules (l :: ls) =
+      let t = trim l
+      in if null t || isPrefixOf "[" t
+           then []
+           else l :: (if isContinuation (fromMaybe "" (head' ls)) then collectModules ls else [])
+
+    findModulesSection : List String -> List String
+    findModulesSection [] = []
+    findModulesSection (l :: ls) =
+      if isModulesStart l
+        then collectModules (l :: ls)
+        else findModulesSection ls
+
+||| Run dumpcases using pack by modifying the original ipkg
 |||
-||| This is useful when the project has complex dependencies that
-||| require pack's package resolution.
+||| Creates a modified ipkg with a dummy main module and --dumpcases option,
+||| then compiles to get case trees for all modules.
 public export
 runDumpcasesWithPack : (backend : Backend)
                     -> (projectDir : String)
@@ -144,47 +191,127 @@ runDumpcasesWithPack : (backend : Backend)
                     -> (outputPath : String)
                     -> IO (Either String String)
 runDumpcasesWithPack backend projectDir ipkgName outputPath = do
-  -- Create a temporary ipkg with opts for --dumpcases
-  let tempIpkgContent = generateTempIpkg backend ipkgName outputPath
-  let tempIpkgPath = projectDir ++ "/_dumpcases_temp.ipkg"
-
-  -- Write temp ipkg
-  writeResult <- writeFile tempIpkgPath tempIpkgContent
-  case writeResult of
-    Left err => pure $ Left $ "Failed to write temp ipkg: " ++ show err
-    Right () => do
-      -- Run pack build
-      let cmd = "cd " ++ projectDir ++ " && pack build _dumpcases_temp.ipkg 2>&1"
-      exitCode <- system cmd
-
-      -- Clean up temp ipkg
-      _ <- system $ "rm -f " ++ tempIpkgPath
-
-      if exitCode /= 0
-        then pure $ Left $ "Pack build failed with exit code " ++ show exitCode
+  -- Read the original ipkg file
+  let ipkgPath = projectDir ++ "/" ++ ipkgName
+  ipkgResult <- readFile ipkgPath
+  case ipkgResult of
+    Left err => pure $ Left $ "Failed to read ipkg file: " ++ show err
+    Right ipkgContent => do
+      let modules = parseModules ipkgContent
+      if null modules
+        then pure $ Left "No modules found in ipkg file"
         else do
-          result <- readFile outputPath
-          case result of
-            Left err => pure $ Left $ "Failed to read dumpcases output: " ++ show err
-            Right content =>
-              if null (trim content)
-                then pure $ Left "No dumpcases output generated"
-                else pure $ Right content
+          -- Parse sourcedir from ipkg (default to ".")
+          let srcDir = parseSourceDir ipkgContent
+
+          -- Create a dummy main module that imports ALL modules
+          -- If there's a Test module, try to call runTests from it
+          let dummyModName = "DumpcasesMain"
+          let importLines = map (\m => "import " ++ m) modules
+          let testMod = findTestModule modules
+          let mainBody = case testMod of
+                           Just tm => tm ++ ".runTests"
+                           Nothing => "pure ()"
+          let dummyMain = unlines $
+                [ "module " ++ dummyModName
+                , ""
+                ] ++ importLines ++
+                [ ""
+                , "main : IO ()"
+                , "main = " ++ mainBody
+                ]
+          let dummyPath = if srcDir == "."
+                            then projectDir ++ "/" ++ dummyModName ++ ".idr"
+                            else projectDir ++ "/" ++ srcDir ++ "/" ++ dummyModName ++ ".idr"
+
+          -- Create modified ipkg that includes all modules plus dummy main
+          let cgOpt = case backend of
+                        ChezBackend => ""
+                        RefcBackend => " --codegen refc"
+                        EvmBackend => " --codegen evm"
+                        CustomBackend name => " --codegen " ++ name
+          let modifiedIpkg = addDumpcasesOpts ipkgContent dummyModName outputPath cgOpt
+          let modifiedIpkgPath = projectDir ++ "/dumpcases_temp.ipkg"
+
+          -- Write temporary files
+          dummyResult <- writeFile dummyPath dummyMain
+          case dummyResult of
+            Left err => pure $ Left $ "Failed to write dummy main: " ++ show err
+            Right () => do
+              ipkgWriteResult <- writeFile modifiedIpkgPath modifiedIpkg
+              case ipkgWriteResult of
+                Left err => do
+                  _ <- system $ "rm -f " ++ dummyPath
+                  pure $ Left $ "Failed to write modified ipkg: " ++ show err
+                Right () => do
+                  -- Run pack build with modified ipkg
+                  let cmd = "cd " ++ projectDir ++ " && pack build dumpcases_temp.ipkg 2>&1"
+                  exitCode <- system cmd
+
+                  -- Clean up temporary files
+                  _ <- system $ "rm -f " ++ dummyPath ++ " " ++ modifiedIpkgPath
+                  _ <- system $ "rm -rf " ++ projectDir ++ "/build/exec/dumpcases_*"
+
+                  if exitCode /= 0
+                    then pure $ Left $ "pack build failed with exit code " ++ show exitCode
+                    else do
+                      result <- readFile outputPath
+                      case result of
+                        Left err => pure $ Left $ "Failed to read dumpcases output: " ++ show err
+                        Right content =>
+                          if null (trim content)
+                            then pure $ Left "No dumpcases output generated"
+                            else pure $ Right content
   where
-    generateTempIpkg : Backend -> String -> String -> String
-    generateTempIpkg be origIpkg out =
-      let cg = case be of
-                 ChezBackend => ""
-                 RefcBackend => " --codegen refc"
-                 EvmBackend => " --codegen evm"
-                 CustomBackend name => " --codegen " ++ name
-          -- Strip .ipkg extension to get package name
-          pkgName = if isSuffixOf ".ipkg" origIpkg
-                      then substr 0 (length origIpkg `minus` 5) origIpkg
-                      else origIpkg
-      in unlines
-        [ "package _dumpcases_temp"
-        , "opts = \"--dumpcases " ++ out ++ cg ++ "\""
-        , "depends = " ++ pkgName
-        , "main = Main"
-        ]
+    findTestModule : List String -> Maybe String
+    findTestModule [] = Nothing
+    findTestModule (m :: ms) =
+      if isInfixOf "Test" m || isInfixOf "test" m
+        then Just m
+        else findTestModule ms
+
+    parseSourceDir : String -> String
+    parseSourceDir content =
+      let ls = lines content
+      in fromMaybe "." (findSourceDir ls)
+      where
+        stripQuotes : String -> String
+        stripQuotes s =
+          let t = trim s
+              chars = unpack t
+          in case chars of
+               ('"' :: rest) =>
+                 -- Remove trailing quote
+                 pack (reverse (drop 1 (reverse rest)))
+               _ => t
+
+        findSourceDir : List String -> Maybe String
+        findSourceDir [] = Nothing
+        findSourceDir (l :: ls) =
+          let t = trim l
+          in if isPrefixOf "sourcedir" t
+               then case break (== '=') (unpack t) of
+                      (_, '=' :: rest) => Just (stripQuotes (pack rest))
+                      _ => findSourceDir ls
+               else findSourceDir ls
+
+    addModule : String -> List String -> List String
+    addModule modName [] = []
+    addModule modName (l :: ls) =
+      if isPrefixOf "modules" (trim l)
+        then (l ++ ", " ++ modName) :: addModule modName ls
+        else l :: addModule modName ls
+
+    -- Add main, executable, and opts to existing ipkg content
+    addDumpcasesOpts : String -> String -> String -> String -> String
+    addDumpcasesOpts content modName outPath cgOpt =
+      let ls = lines content
+          -- Add DumpcasesMain to modules
+          modsAdded = addModule modName ls
+          -- Add main, executable, and opts
+          extras = [ ""
+                   , "main = " ++ modName
+                   , "executable = dumpcases_runner"
+                   , "opts = \"--dumpcases " ++ outPath ++ cgOpt ++ "\""
+                   ]
+      in unlines (modsAdded ++ extras)
